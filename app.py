@@ -1,41 +1,58 @@
 # Ritual Creative Lab — POC (Powered by ZARI)
 # Free, CPU-only Streamlit app. No API keys. No paid services.
 
+import hashlib
 import io
 import json
+import math
+import random
 import zipfile
 from datetime import datetime
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Tuple
 
 import numpy as np
+import pandas as pd
 import streamlit as st
 from PIL import Image, ImageDraw, ImageFont
 from sklearn.cluster import KMeans
 
-from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, pipeline
-from sentence_transformers import SentenceTransformer
-
 APP_TITLE = "Ritual Creative Lab — POC (Powered by ZARI)"
 BRAND_BAR = "Ritual Ads • Powered by ZARI"
+RANDOM_SEED = 42  # deterministic demo behavior
 
-# --- Streamlit page config MUST be first Streamlit call ---
+# --- Streamlit page config MUST be the first Streamlit call ---
 st.set_page_config(page_title=APP_TITLE, page_icon="✨", layout="wide")
 
 
-# ------------------------------ Models ------------------------------ #
+# -------------------------------------------------------------------
+# Model loading with graceful fallback (Lite Mode)
+# -------------------------------------------------------------------
 @st.cache_resource(show_spinner=True)
-def load_models():
-    """Load small CPU-friendly models; cached across runs."""
-    tok = AutoTokenizer.from_pretrained("google/flan-t5-small")
-    mdl = AutoModelForSeq2SeqLM.from_pretrained("google/flan-t5-small")
-    gen = pipeline("text2text-generation", model=mdl, tokenizer=tok, device=-1)
+def _try_load_models():
+    """
+    Try loading transformers + sentence-transformers.
+    If anything fails (e.g., memory/time), return (None, None) and the app will switch to Lite Mode.
+    """
+    try:
+        from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, pipeline
+        from sentence_transformers import SentenceTransformer
 
-    embedder = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
-    return gen, embedder
+        tok = AutoTokenizer.from_pretrained("google/flan-t5-small")
+        mdl = AutoModelForSeq2SeqLM.from_pretrained("google/flan-t5-small")
+        gen = pipeline("text2text-generation", model=mdl, tokenizer=tok, device=-1)
+
+        embedder = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+        return gen, embedder
+    except Exception as e:
+        return None, None
+
+
+GEN, EMBEDDER = _try_load_models()
+HAS_MODELS = GEN is not None and EMBEDDER is not None
 
 
 def gen_text(gen, prompt: str, max_tokens: int = 128) -> str:
-    """Generate text from the local T5 model with conservative sampling."""
+    """Generate text from local T5 model with conservative sampling."""
     out = gen(
         prompt,
         max_length=max_tokens,
@@ -47,7 +64,36 @@ def gen_text(gen, prompt: str, max_tokens: int = 128) -> str:
     return out[0]["generated_text"].strip()
 
 
-# ------------------------------ Visuals ------------------------------ #
+def gen_text_lite(brand_desc: str, goal: str, tone: str, persona: str) -> Tuple[str, str, str]:
+    """
+    Lite Mode templated generation (no ML). Provides clean, believable copy if models are unavailable.
+    """
+    random.seed(hash((brand_desc, goal, tone, persona)) % (2**32))
+    # Headline options
+    h_templates = [
+        "Make It Ritual",
+        "Turn Moments Into Meaning",
+        "Where Story Meets Action",
+        "Designed to Be Remembered",
+        "Rituals That Move People",
+        "Crafted For Connection",
+        "Heart + Data = Impact",
+    ]
+    headline = random.choice(h_templates)
+    # Body
+    body = (
+        f"For {persona.lower()}, we connect {brand_desc.lower()} with {goal.lower()} outcomes — "
+        f"human-centered creative guided by signals, delivered with modern precision."
+    )
+    # CTA
+    ctas = ["See How", "Start Your Ritual", "Try It Today", "Get the Playbook", "Learn More"]
+    cta = random.choice(ctas)
+    return headline, body, cta
+
+
+# -------------------------------------------------------------------
+# Visuals
+# -------------------------------------------------------------------
 def safe_font(size: int = 48):
     """Try a common TTF; fallback to PIL default if unavailable."""
     try:
@@ -140,7 +186,9 @@ def draw_poster(headline: str, sub: str, cta: str, tone: str, size=(1080, 1350))
     return bg
 
 
-# ------------------------------ Copy Gen ------------------------------ #
+# -------------------------------------------------------------------
+# Copy generation prompts + parsing
+# -------------------------------------------------------------------
 def make_copy_prompt(brand_desc: str, goal: str, tone: str, persona: str) -> str:
     return f"""
 You are a senior creative at a human-centered AI advertising studio.
@@ -160,7 +208,7 @@ CTA: ...
 """.strip()
 
 
-def parse_copy(text: str):
+def parse_copy(text: str) -> Tuple[str, str, str]:
     lines = text.splitlines()
     get = lambda key: next((l.split(":", 1)[1].strip() for l in lines if l.strip().lower().startswith(f"{key}:")), "")
     h = get("headline") or text[:70]
@@ -169,22 +217,63 @@ def parse_copy(text: str):
     return h, b, c
 
 
-def cluster_personas(embedder, personas: List[str], k: int):
-    if len(personas) == 0:
-        return [], []
+# -------------------------------------------------------------------
+# Persona clustering
+# -------------------------------------------------------------------
+def cluster_personas(personas: List[str], k: int):
+    """
+    Use embeddings if available; otherwise fall back to lexical hashing clusters.
+    Returns labels and human-readable segment summaries.
+    """
     k = max(1, min(k, len(personas)))
-    X = embedder.encode(personas)
-    if len(personas) == 1:
-        return [0], ["Segment 1: Solo"]
-    km = KMeans(n_clusters=k, n_init=10, random_state=42)
-    lab = km.fit_predict(X)
-    summaries = []
-    for c in range(k):
-        idx = np.where(lab == c)[0]
-        centroid = km.cluster_centers_[c]
-        dists = np.linalg.norm(X[idx] - centroid, axis=1)
-        summaries.append(f"Segment {c+1}: like '{personas[idx[np.argmin(dists)]]}'")
-    return lab, summaries
+    if HAS_MODELS:
+        X = EMBEDDER.encode(personas)
+        if len(personas) == 1:
+            return [0], ["Segment 1: Solo"]
+        km = KMeans(n_clusters=k, n_init=10, random_state=RANDOM_SEED)
+        lab = km.fit_predict(X)
+        summaries = []
+        for c in range(k):
+            idx = np.where(lab == c)[0]
+            centroid = km.cluster_centers_[c]
+            dists = np.linalg.norm(X[idx] - centroid, axis=1)
+            rep = personas[idx[np.argmin(dists)]]
+            summaries.append(f"Segment {c+1}: like '{rep}'")
+        return lab.tolist(), summaries
+    else:
+        # Lite clustering: hash tokens to buckets
+        lab = []
+        for p in personas:
+            bucket = hash(p.lower()) % k
+            lab.append(bucket)
+        summaries = [f"Segment {i+1}: keyword-driven cluster" for i in range(k)]
+        return lab, summaries
+
+
+# -------------------------------------------------------------------
+# Helpers: channels, analytics, packaging
+# -------------------------------------------------------------------
+def suggest_channel(goal: str) -> str:
+    g = (goal or "").lower()
+    if "awareness" in g:
+        return "IG Reels / TikTok / YouTube Shorts"
+    if "engagement" in g:
+        return "Instagram Carousel / LinkedIn Post"
+    if "signups" in g or "leads" in g:
+        return "LinkedIn Lead Gen / Landing Page"
+    if "sales" in g or "conversions" in g:
+        return "Retargeting Display + Email"
+    return "Social + Landing Page"
+
+
+def seeded_score(*args) -> float:
+    """
+    Deterministic 0-100 score based on hash of inputs — looks like analytics,
+    useful for demo without real data.
+    """
+    h = hashlib.sha256(("||".join([str(a) for a in args])).encode()).hexdigest()
+    val = int(h[:6], 16)  # take first 3 bytes
+    return round(40 + (val % 6000) / 100.0, 1)  # 40.0 to ~100.0
 
 
 def package_zip(artifacts: Dict[str, Any]) -> bytes:
@@ -202,12 +291,14 @@ def package_zip(artifacts: Dict[str, Any]) -> bytes:
     return buf.read()
 
 
-# ------------------------------ UI ------------------------------ #
+# -------------------------------------------------------------------
+# UI
+# -------------------------------------------------------------------
 def header_bar():
     st.markdown(
         """
         <div style="padding:10px 16px;border-radius:12px;background:#0f172a;color:#e2e8f0;
-             display:flex;justify-content:space-between;align-items:center;">
+             display:flex;gap:12px;justify-content:space-between;align-items:center;">
             <div style="font-size:18px;font-weight:700;">Ritual Creative Lab — POC (Powered by ZARI)</div>
             <div style="opacity:0.85;">Free • Local models • No API keys</div>
         </div>
@@ -232,13 +323,11 @@ def load_demo():
 
 
 def main():
+    random.seed(RANDOM_SEED)
     header_bar()
-    gen, embedder = load_models()
 
-    # Sidebar inputs (with session_state defaults)
     with st.sidebar:
         st.subheader("Brand & Campaign")
-
         if "brand_desc" not in st.session_state:
             st.session_state.brand_desc = ""
         if "goal" not in st.session_state:
@@ -248,8 +337,10 @@ def main():
         if "personas_text" not in st.session_state:
             st.session_state.personas_text = ""
 
-        if st.button("Load Demo Personas"):
+        colb1, colb2 = st.columns(2)
+        if colb1.button("Load Demo Campaign"):
             load_demo()
+        lite_mode = colb2.toggle("Lite Mode", value=not HAS_MODELS, help="Use fast templated generation if models can't load.")
 
         brand_desc = st.text_area("Brand description (who/why/ritual):", key="brand_desc", height=120)
         goal = st.selectbox("Primary goal", ["Awareness", "Engagement", "Signups/Leads", "Sales/Conversions"], key="goal")
@@ -262,11 +353,17 @@ def main():
             key="personas_text",
             height=140,
         )
-        k_clusters = st.slider("Number of persona segments", min_value=1, max_value=6, value=2)
+        k_clusters = st.slider("Number of persona segments", min_value=1, max_value=6, value=2, help="How many audience clusters to generate.")
 
         st.markdown("---")
         n_variants = st.slider("Variants per segment", 1, 3, 2)
         st.caption("Branding: Ritual Ads • Powered by ZARI")
+
+        st.markdown("---")
+        with st.expander("Integrations (preview)"):
+            st.button("Connect Google Ads (coming soon)", disabled=True, use_container_width=True)
+            st.button("Connect Meta Business Suite (coming soon)", disabled=True, use_container_width=True)
+            st.button("Export to HubSpot / Salesforce (coming soon)", disabled=True, use_container_width=True)
 
     personas = [p.strip() for p in personas_text.splitlines() if p.strip()]
     tabs = st.tabs(["Plan", "Generate", "Review & Download"])
@@ -274,15 +371,24 @@ def main():
     with tabs[0]:
         st.markdown("### Creative Plan")
         st.write(
-            "- Cluster personas, generate copy per segment, auto-create visual posters.\n"
+            "- Cluster personas → generate copy per segment → auto-create poster visuals.\n"
             "- Everything runs **locally** with open-source models on CPU.\n"
-            "- Outputs: **headline, body, CTA**, and **2 PNG visuals** per variant.\n"
+            "- Outputs: **headline, body, CTA**, suggested **channel**, and **2 PNG visuals** per variant.\n"
             "- Download a **ZIP** (PNG + copy.json) from the final tab."
         )
         if brand_desc:
             st.info(f"Brand Summary: {brand_desc}")
         if personas:
             st.success(f"{len(personas)} persona(s) provided.")
+
+        # Analytics Preview (simulated)
+        if personas:
+            st.markdown("#### Simulated Impact Preview")
+            df_prev = pd.DataFrame({
+                "Persona": personas[:8],  # show up to 8 for readability
+                "Predicted Engagement Lift (%)": [seeded_score(brand_desc, p, goal, tone) for p in personas[:8]],
+            })
+            st.bar_chart(df_prev.set_index("Persona"))
 
     with tabs[1]:
         st.markdown("### Generate Ad Packages")
@@ -291,27 +397,50 @@ def main():
                 st.error("Please provide a brand description and at least one persona in the sidebar.")
                 st.stop()
 
-            labels, summaries = cluster_personas(embedder, personas, k_clusters)
+            labels, summaries = cluster_personas(personas, k_clusters)
             st.session_state["segments"] = []
             now_tag = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
 
             for seg_idx, seg_title in enumerate(summaries):
                 seg_personas = [p for p, lab in zip(personas, labels) if lab == seg_idx]
+                if not seg_personas:
+                    continue
+
                 st.write(f"#### {seg_title}")
                 st.caption(f"Personas in this segment: {', '.join(seg_personas)}")
 
                 seg_outputs = {"segment": seg_title, "variants": []}
                 for v in range(n_variants):
-                    prompt = make_copy_prompt(brand_desc, goal, tone, f"{seg_title}. People like: {', '.join(seg_personas[:3])}.")
-                    raw = gen_text(gen, prompt, max_tokens=128)
-                    headline, body, cta = parse_copy(raw)
+                    persona_hint = ", ".join(seg_personas[:3])
+                    if not lite_mode and HAS_MODELS:
+                        prompt = make_copy_prompt(brand_desc, goal, tone, f"{seg_title}. People like: {persona_hint}.")
+                        try:
+                            from transformers import Pipeline  # type: ignore
+                            raw = gen_text(GEN, prompt, max_tokens=128)
+                            headline, body, cta = parse_copy(raw)
+                        except Exception:
+                            headline, body, cta = gen_text_lite(brand_desc, goal, tone, seg_title)
+                    else:
+                        headline, body, cta = gen_text_lite(brand_desc, goal, tone, seg_title)
 
+                    channel = suggest_channel(goal)
                     posters = [draw_poster(headline, body, cta, tone, size=(1080, 1350)) for _ in range(2)]
-                    seg_outputs["variants"].append({"headline": headline, "body": body, "cta": cta})
+
+                    seg_outputs["variants"].append({
+                        "headline": headline,
+                        "body": body,
+                        "cta": cta,
+                        "channel": channel,
+                        "personas": seg_personas,
+                    })
 
                     cols = st.columns(2)
                     cols[0].image(posters[0], caption=f"Variant {v+1} Visual A", use_column_width=True)
                     cols[1].image(posters[1], caption=f"Variant {v+1} Visual B", use_column_width=True)
+
+                    # Mini-metrics (simulated)
+                    lift = seeded_score(brand_desc, seg_title, goal, tone, v)
+                    st.caption(f"Predicted Engagement Lift: **{lift}%**  •  Suggested: **{channel}**")
 
                 st.session_state["segments"].append(seg_outputs)
 
@@ -324,7 +453,16 @@ def main():
                         path = f"images/segment{s_i+1}_variant{v_i+1}_{ab}.png"
                         images_for_zip.append({"image": img, "path": path})
 
-            copy_payload = {"brand": brand_desc, "goal": goal, "tone": tone, "segments": st.session_state["segments"]}
+            copy_payload = {
+                "brand": brand_desc,
+                "goal": goal,
+                "tone": tone,
+                "segments": st.session_state["segments"],
+                "meta": {
+                    "generated_at_utc": datetime.utcnow().isoformat() + "Z",
+                    "lite_mode": bool(lite_mode or not HAS_MODELS),
+                }
+            }
             st.session_state["artifacts"] = {"copy": copy_payload, "images": images_for_zip, "tag": now_tag}
             st.success("Generation complete. Review & download in the next tab.")
 
@@ -336,7 +474,12 @@ def main():
             for seg in st.session_state["artifacts"]["copy"]["segments"]:
                 st.write(f"**{seg['segment']}**")
                 for idx, v in enumerate(seg["variants"], start=1):
-                    st.write(f"- **V{idx}** — **{v['headline']}**  \n  {v['body']}  \n  _CTA: {v['cta']}_")
+                    st.write(
+                        f"- **V{idx}** — **{v['headline']}**  \n"
+                        f"  {v['body']}  \n"
+                        f"  _CTA: {v['cta']}_  \n"
+                        f"  _Channel: {v['channel']}_"
+                    )
 
             zip_bytes = package_zip(st.session_state["artifacts"])
             name = f"ritual_ads_poc_{st.session_state['artifacts']['tag']}.zip"
