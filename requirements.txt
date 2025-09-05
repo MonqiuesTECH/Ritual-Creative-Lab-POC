@@ -1,10 +1,10 @@
 streamlit==1.37.1
 transformers==4.44.2
 sentence-transformers==3.0.1
-torch==2.3.1             # or 2.5.1 if you're on Python 3.13
+torch==2.3.1
 scikit-learn==1.5.1
 Pillow==10.4.0
-numpy==1.26.4            # or 2.1.1 if you're on Python 3.13
+numpy==1.26.4
 pandas==2.2.2
 moviepy==1.0.3
 imageio-ffmpeg==0.4.9
