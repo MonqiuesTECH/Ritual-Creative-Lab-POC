@@ -1,3 +1,6 @@
+# Ritual Creative Lab — POC (Powered by ZARI)
+# Free, CPU-only Streamlit app. No API keys. No paid services.
+
 import io
 import json
 import zipfile
@@ -7,49 +10,64 @@ from typing import List, Dict, Any
 import numpy as np
 import streamlit as st
 from PIL import Image, ImageDraw, ImageFont
+from sklearn.cluster import KMeans
 
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, pipeline
 from sentence_transformers import SentenceTransformer
-from sklearn.cluster import KMeans
 
 APP_TITLE = "Ritual Creative Lab — POC (Powered by ZARI)"
 BRAND_BAR = "Ritual Ads • Powered by ZARI"
 
-@st.cache_resource(show_spinner=False)
+# --- Streamlit page config MUST be first Streamlit call ---
+st.set_page_config(page_title=APP_TITLE, page_icon="✨", layout="wide")
+
+
+# ------------------------------ Models ------------------------------ #
+@st.cache_resource(show_spinner=True)
 def load_models():
+    """Load small CPU-friendly models; cached across runs."""
     tok = AutoTokenizer.from_pretrained("google/flan-t5-small")
     mdl = AutoModelForSeq2SeqLM.from_pretrained("google/flan-t5-small")
     gen = pipeline("text2text-generation", model=mdl, tokenizer=tok, device=-1)
+
     embedder = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
     return gen, embedder
 
+
 def gen_text(gen, prompt: str, max_tokens: int = 128) -> str:
+    """Generate text from the local T5 model with conservative sampling."""
     out = gen(
         prompt,
         max_length=max_tokens,
         do_sample=True,
         top_p=0.92,
         temperature=0.8,
-        num_return_sequences=1
+        num_return_sequences=1,
     )
     return out[0]["generated_text"].strip()
 
-def safe_font(size=48):
+
+# ------------------------------ Visuals ------------------------------ #
+def safe_font(size: int = 48):
+    """Try a common TTF; fallback to PIL default if unavailable."""
     try:
         return ImageFont.truetype("DejaVuSans.ttf", size=size)
-    except:
+    except Exception:
         return ImageFont.load_default()
 
-def make_gradient(w, h, start_rgb, end_rgb):
+
+def make_gradient(w: int, h: int, start_rgb, end_rgb):
     base = Image.new("RGB", (w, h), start_rgb)
     top = Image.new("RGB", (w, h), end_rgb)
     mask = Image.linear_gradient("L").resize((w, h))
     return Image.composite(top, base, mask)
 
+
 def contrast_color(rgb):
     r, g, b = rgb
-    yiq = (r*299 + g*587 + b*114) / 1000
+    yiq = (r * 299 + g * 587 + b * 114) / 1000
     return (0, 0, 0) if yiq > 128 else (255, 255, 255)
+
 
 def pick_palette(tone: str):
     t = (tone or "").lower()
@@ -63,6 +81,7 @@ def pick_palette(tone: str):
         return ((44, 62, 80), (52, 152, 219))   # slate -> azure
     return ((219, 112, 147), (44, 44, 56))      # rose -> deep slate
 
+
 def draw_poster(headline: str, sub: str, cta: str, tone: str, size=(1080, 1350)) -> Image.Image:
     w, h = size
     start, end = pick_palette(tone)
@@ -75,7 +94,7 @@ def draw_poster(headline: str, sub: str, cta: str, tone: str, size=(1080, 1350))
     f_cta = safe_font(size=int(0.05 * w))
     f_brand = safe_font(size=int(0.035 * w))
 
-    text_color = contrast_color(((start[0]+end[0])//2, (start[1]+end[1])//2, (start[2]+end[2])//2))
+    text_color = contrast_color(((start[0] + end[0]) // 2, (start[1] + end[1]) // 2, (start[2] + end[2]) // 2))
 
     # Headline
     y = pad
@@ -116,12 +135,12 @@ def draw_poster(headline: str, sub: str, cta: str, tone: str, size=(1080, 1350))
     draw.text((btn_x + (btn_w - cta_w) / 2, btn_y + (btn_h - cta_h) / 2), cta, font=f_cta, fill=txt_color)
 
     # Brand footer
-    footer = BRAND_BAR
-    footer_w = draw.textlength(footer, font=f_brand)
-    draw.text((w - pad - footer_w, h - pad - f_brand.size - 4), footer, font=f_brand, fill=text_color)
-
+    footer_w = draw.textlength(BRAND_BAR, font=f_brand)
+    draw.text((w - pad - footer_w, h - pad - f_brand.size - 4), BRAND_BAR, font=f_brand, fill=text_color)
     return bg
 
+
+# ------------------------------ Copy Gen ------------------------------ #
 def make_copy_prompt(brand_desc: str, goal: str, tone: str, persona: str) -> str:
     return f"""
 You are a senior creative at a human-centered AI advertising studio.
@@ -140,6 +159,7 @@ BODY: ...
 CTA: ...
 """.strip()
 
+
 def parse_copy(text: str):
     lines = text.splitlines()
     get = lambda key: next((l.split(":", 1)[1].strip() for l in lines if l.strip().lower().startswith(f"{key}:")), "")
@@ -147,6 +167,7 @@ def parse_copy(text: str):
     b = get("body") or text
     c = get("cta") or "Learn More"
     return h, b, c
+
 
 def cluster_personas(embedder, personas: List[str], k: int):
     if len(personas) == 0:
@@ -165,6 +186,7 @@ def cluster_personas(embedder, personas: List[str], k: int):
         summaries.append(f"Segment {c+1}: like '{personas[idx[np.argmin(dists)]]}'")
     return lab, summaries
 
+
 def package_zip(artifacts: Dict[str, Any]) -> bytes:
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
@@ -179,35 +201,67 @@ def package_zip(artifacts: Dict[str, Any]) -> bytes:
     buf.seek(0)
     return buf.read()
 
-def ui_header():
-    st.set_page_config(page_title=APP_TITLE, page_icon="✨", layout="wide")
+
+# ------------------------------ UI ------------------------------ #
+def header_bar():
     st.markdown(
-        f"""
-        <div style="padding:10px 16px;border-radius:12px;background:#0f172a;color:#e2e8f0;display:flex;justify-content:space-between;align-items:center;">
-            <div style="font-size:18px;font-weight:700;">{APP_TITLE}</div>
-            <div style="opacity:0.85;">Free POC • Local models • No API keys</div>
+        """
+        <div style="padding:10px 16px;border-radius:12px;background:#0f172a;color:#e2e8f0;
+             display:flex;justify-content:space-between;align-items:center;">
+            <div style="font-size:18px;font-weight:700;">Ritual Creative Lab — POC (Powered by ZARI)</div>
+            <div style="opacity:0.85;">Free • Local models • No API keys</div>
         </div>
         """,
-        unsafe_allow_html=True
+        unsafe_allow_html=True,
     )
 
+
+def load_demo():
+    st.session_state.brand_desc = "We blend timeless ritual with human-centered AI to move hearts and drive results."
+    st.session_state.goal = "Engagement"
+    st.session_state.tone = "Bold, modern, human-centered"
+    st.session_state.personas_text = "\n".join(
+        [
+            "Fitness-curious millennials",
+            "CTOs at seed-stage SaaS",
+            "Wellness-focused new moms",
+            "Creators launching digital courses",
+            "Eco-conscious urban professionals",
+        ]
+    )
+
+
 def main():
-    ui_header()
+    header_bar()
     gen, embedder = load_models()
 
+    # Sidebar inputs (with session_state defaults)
     with st.sidebar:
         st.subheader("Brand & Campaign")
-        brand_desc = st.text_area(
-            "Brand description (who/why/ritual):",
-            height=120,
-            placeholder="We blend timeless ritual with human-centered AI to move hearts and drive results."
-        )
-        goal = st.selectbox("Primary goal", ["Awareness", "Engagement", "Signups/Leads", "Sales/Conversions"])
-        tone = st.text_input("Voice / Tone", value="Bold, modern, human-centered")
+
+        if "brand_desc" not in st.session_state:
+            st.session_state.brand_desc = ""
+        if "goal" not in st.session_state:
+            st.session_state.goal = "Engagement"
+        if "tone" not in st.session_state:
+            st.session_state.tone = "Bold, modern, human-centered"
+        if "personas_text" not in st.session_state:
+            st.session_state.personas_text = ""
+
+        if st.button("Load Demo Personas"):
+            load_demo()
+
+        brand_desc = st.text_area("Brand description (who/why/ritual):", key="brand_desc", height=120)
+        goal = st.selectbox("Primary goal", ["Awareness", "Engagement", "Signups/Leads", "Sales/Conversions"], key="goal")
+        tone = st.text_input("Voice / Tone", key="tone")
 
         st.markdown("---")
         st.subheader("Personas (one per line)")
-        personas_text = st.text_area("Examples: 'Fitness-curious millennials', 'CTOs at seed-stage SaaS', etc.", height=140)
+        personas_text = st.text_area(
+            "Examples: 'Fitness-curious millennials', 'CTOs at seed-stage SaaS', etc.",
+            key="personas_text",
+            height=140,
+        )
         k_clusters = st.slider("Number of persona segments", min_value=1, max_value=6, value=2)
 
         st.markdown("---")
@@ -252,7 +306,6 @@ def main():
                     raw = gen_text(gen, prompt, max_tokens=128)
                     headline, body, cta = parse_copy(raw)
 
-                    # two visual variants
                     posters = [draw_poster(headline, body, cta, tone, size=(1080, 1350)) for _ in range(2)]
                     seg_outputs["variants"].append({"headline": headline, "body": body, "cta": cta})
 
@@ -262,7 +315,7 @@ def main():
 
                 st.session_state["segments"].append(seg_outputs)
 
-            # Stash images to ZIP
+            # Assemble artifacts for ZIP
             images_for_zip = []
             for s_i, seg in enumerate(st.session_state["segments"]):
                 for v_i, variant in enumerate(seg["variants"]):
@@ -280,13 +333,11 @@ def main():
         if "artifacts" not in st.session_state:
             st.info("Run the generator first.")
         else:
-            # Preview copy
             for seg in st.session_state["artifacts"]["copy"]["segments"]:
                 st.write(f"**{seg['segment']}**")
                 for idx, v in enumerate(seg["variants"], start=1):
                     st.write(f"- **V{idx}** — **{v['headline']}**  \n  {v['body']}  \n  _CTA: {v['cta']}_")
 
-            # ZIP download
             zip_bytes = package_zip(st.session_state["artifacts"])
             name = f"ritual_ads_poc_{st.session_state['artifacts']['tag']}.zip"
             st.download_button(
@@ -294,9 +345,10 @@ def main():
                 data=zip_bytes,
                 file_name=name,
                 mime="application/zip",
-                use_container_width=True
+                use_container_width=True,
             )
             st.caption("All assets are generated locally. Modify tone/personas, re-run, and download again.")
+
 
 if __name__ == "__main__":
     main()
