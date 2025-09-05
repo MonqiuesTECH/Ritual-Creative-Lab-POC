@@ -1,12 +1,14 @@
 # Ritual Creative Lab — POC (Powered by ZARI)
-# Quality upgrade: cleaner copy, CTA fix, brand kit, premium poster templates.
-# Free, CPU-only Streamlit app. No API keys.
+# Video upgrade: clean copy, premium posters, optional short MP4 videos per variant.
+# Free, CPU-only. No API keys.
 
 import hashlib
 import io
 import json
+import os
 import random
 import re
+import tempfile
 import zipfile
 from datetime import datetime
 from typing import List, Dict, Any, Tuple
@@ -23,14 +25,12 @@ RANDOM_SEED = 42
 
 st.set_page_config(page_title=APP_TITLE, page_icon="✨", layout="wide")
 
-
-# ---------------- Models (optional) ---------------- #
+# ---------------- Optional models (kept for experimentation) ---------------- #
 @st.cache_resource(show_spinner=False)
 def _try_load_models():
     try:
         from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, pipeline
         from sentence_transformers import SentenceTransformer
-
         tok = AutoTokenizer.from_pretrained("google/flan-t5-small")
         mdl = AutoModelForSeq2SeqLM.from_pretrained("google/flan-t5-small")
         gen = pipeline("text2text-generation", model=mdl, tokenizer=tok, device=-1)
@@ -43,8 +43,7 @@ GEN, EMBEDDER = _try_load_models()
 HAS_MODELS = GEN is not None and EMBEDDER is not None
 random.seed(RANDOM_SEED)
 
-
-# ---------------- Helpers ---------------- #
+# ---------------- Utilities ---------------- #
 def hex_to_rgb(h: str) -> Tuple[int, int, int]:
     h = h.lstrip("#")
     return tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
@@ -79,8 +78,7 @@ def seeded_score(*args) -> float:
     val = int(h[:6], 16)
     return round(40 + (val % 6000) / 100.0, 1)  # 40.0–100.0
 
-
-# ---------------- Copy engine ---------------- #
+# ---------------- Copy engine (Lite) ---------------- #
 POWER_VERBS = ["Transform", "Turn", "Make", "Scale", "Automate", "Unlock", "Elevate"]
 RESULT_WORDS = {
     "Awareness": ["attention", "reach", "buzz"],
@@ -106,19 +104,15 @@ def polish_sentence(s: str) -> str:
     if s[-1] not in ".!?": s += "."
     return s
 
-def compose_copy_lite(brand_desc: str, goal: str, tone: str, persona: str) -> Tuple[str, str, str]:
-    """High-quality deterministic copy without ML (AIDA/PAS flavored)."""
+def compose_copy_lite(brand_desc: str, goal: str, tone: str, persona_label: str) -> Tuple[str, str, str]:
     verb = random.choice(POWER_VERBS)
     result = random.choice(RESULT_WORDS.get(goal, ["results"]))
-    # Headline ≤ 8 words
-    headline = truncate_words(f"{verb} {persona} rituals into {result}", 8)
-    # Body ≤ ~30 words, human-centered + precision
+    headline = truncate_words(f"{verb} {persona_label} rituals into {result}", 8)
     body = (
-        f"For {persona.lower()}, ZARI blends human-centered creative with signal-driven precision — "
+        f"For {persona_label.lower()}, ZARI blends human-centered creative with signal-driven precision — "
         f"{brand_desc.lower()} — to deliver repeatable wins you can measure."
     )
-    body = truncate_words(body, 28)
-    body = polish_sentence(body)
+    body = polish_sentence(truncate_words(body, 28))
     cta = random.choice(CTA_BY_GOAL.get(goal, ["Learn More"]))
     return headline, body, cta
 
@@ -126,13 +120,13 @@ def gen_text(gen, prompt: str, max_tokens: int = 128) -> str:
     out = gen(prompt, max_length=max_tokens, do_sample=True, top_p=0.9, temperature=0.7, num_return_sequences=1)
     return out[0]["generated_text"].strip()
 
-def make_copy_prompt(brand_desc: str, goal: str, tone: str, persona: str) -> str:
+def make_copy_prompt(brand_desc: str, goal: str, tone: str, persona_label: str) -> str:
     return f"""
 You are a senior creative at a human-centered AI advertising studio.
 Brand: {brand_desc}
 Goal: {goal}
 Tone: {tone}
-Persona: {persona}
+Persona: {persona_label}
 
 Generate:
 1) HEADLINE (<=8 words)
@@ -144,22 +138,16 @@ BODY: <body>
 CTA: <cta>
 """.strip()
 
-CTA_RE = re.compile(r"^CTA:\s*(.+)$", flags=re.I|re.M)     # strict CTA (no more ACT)
-HEAD_RE = re.compile(r"^HEADLINE:\s*(.+)$", flags=re.I|re.M)
-BODY_RE = re.compile(r"^BODY:\s*(.+)$", flags=re.I|re.M)
+HEAD_RE = re.compile(r"^HEADLINE:\s*(.+)$", re.I|re.M)
+BODY_RE = re.compile(r"^BODY:\s*(.+)$", re.I|re.M)
+CTA_RE  = re.compile(r"^CTA:\s*(.+)$", re.I|re.M)
 
 def parse_copy(text: str) -> Tuple[str, str, str]:
-    h = HEAD_RE.search(text)
-    b = BODY_RE.search(text)
-    c = CTA_RE.search(text)
-    headline = h.group(1).strip() if h else text[:70]
-    body = b.group(1).strip() if b else text
-    cta = c.group(1).strip() if c else "Learn More"
-    headline = truncate_words(headline, 8)
-    body = polish_sentence(truncate_words(body, 30))
-    cta = truncate_words(cta, 6)
+    h = HEAD_RE.search(text); b = BODY_RE.search(text); c = CTA_RE.search(text)
+    headline = truncate_words((h.group(1).strip() if h else text[:70]), 8)
+    body = polish_sentence(truncate_words((b.group(1).strip() if b else text), 30))
+    cta = truncate_words((c.group(1).strip() if c else "Learn More"), 6)
     return headline, body, cta
-
 
 # ---------------- Clustering ---------------- #
 def cluster_personas(personas: List[str], k: int):
@@ -178,13 +166,12 @@ def cluster_personas(personas: List[str], k: int):
             rep = personas[idx[np.argmin(dists)]]
             summaries.append(f"Segment {c+1}: like '{rep}'")
         return lab.tolist(), summaries
-    # lite clustering fallback
+    # fallback: lexical hash buckets
     lab = [(hash(p.lower()) % k) for p in personas]
     summaries = [f"Segment {i+1}: keyword-driven cluster" for i in range(k)]
     return lab, summaries
 
-
-# ---------------- Visuals (premium templates) ---------------- #
+# ---------------- Visuals (premium posters) ---------------- #
 def draw_poster(headline: str, sub: str, cta: str, tone: str,
                 size=(1080, 1350),
                 template: str = "Hero",
@@ -194,7 +181,6 @@ def draw_poster(headline: str, sub: str, cta: str, tone: str,
     if color_override:
         start, end = color_override
     else:
-        # tasteful defaults
         if any(k in (tone or "").lower() for k in ["premium","lux","elegant"]):
             start, end = ((25,25,30), (160,136,98))
         elif any(k in (tone or "").lower() for k in ["calm","wellness","mindful"]):
@@ -208,78 +194,94 @@ def draw_poster(headline: str, sub: str, cta: str, tone: str,
     draw = ImageDraw.Draw(bg)
     text_color = contrast_color(((start[0]+end[0])//2, (start[1]+end[1])//2, (start[2]+end[2])//2))
 
-    # fonts
     f_head = safe_font(size=int(0.085 * w))
     f_sub  = safe_font(size=int(0.045 * w))
     f_cta  = safe_font(size=int(0.05  * w))
     f_brand= safe_font(size=int(0.035 * w))
-
     pad = int(0.08 * w)
 
+    def wrap(text, font, maxw):
+        lines, cur = [], ""
+        for t in text.split():
+            test = (cur + " " + t).strip()
+            if draw.textlength(test, font=font) <= maxw: cur = test
+            else: lines.append(cur); cur = t
+        if cur: lines.append(cur)
+        return lines
+
     if template == "Split Stripe":
-        # left stripe
         stripe_w = int(0.18 * w)
         draw.rectangle([0,0,stripe_w,h], fill=(0,0,0,40))
-        x = pad
-        y = pad
+        x, y = pad, pad
         draw.text((x, y), headline, font=f_head, fill=text_color)
         y += int(0.11 * h)
-        # wrap sub
         max_w = w - stripe_w - pad*2
-        def wrap(text, font, maxw):
-            lines, cur = [], ""
-            for t in text.split():
-                test = (cur + " " + t).strip()
-                if draw.textlength(test, font=font) <= maxw: cur = test
-                else: lines.append(cur); cur = t
-            if cur: lines.append(cur)
-            return lines
         for line in wrap(sub, f_sub, max_w):
             draw.text((x, y), line, font=f_sub, fill=text_color)
             y += int(0.055 * h)
-
-        # CTA button
-        btn_h = int(0.11 * h); btn_w = int(0.58 * w)
-        btn_x = x; btn_y = h - pad - btn_h
-        btn_color = (255,255,255) if sum(text_color) < 384 else (0,0,0)
-        txt_color = (0,0,0) if btn_color == (255,255,255) else (255,255,255)
-        draw.rounded_rectangle([btn_x, btn_y, btn_x+btn_w, btn_y+btn_h], radius=28, fill=btn_color)
-        cta_w = draw.textlength(cta, font=f_cta); cta_h = f_cta.size
-        draw.text((btn_x + (btn_w-cta_w)/2, btn_y + (btn_h-cta_h)/2), cta, font=f_cta, fill=txt_color)
-
-    else:  # Hero (center)
+        btn_h = int(0.11*h); btn_w = int(0.58*w)
+        btn_x, btn_y = x, h - pad - btn_h
+    else:  # Hero
         y = pad
         draw.text((pad, y), headline, font=f_head, fill=text_color)
         y += int(0.12 * h)
-        # wrap sub
         max_w = w - 2*pad
-        def wrap(text, font, maxw):
-            lines, cur = [], ""
-            for t in text.split():
-                test = (cur + " " + t).strip()
-                if draw.textlength(test, font=font) <= maxw: cur = test
-                else: lines.append(cur); cur = t
-            if cur: lines.append(cur)
-            return lines
         for line in wrap(sub, f_sub, max_w):
-            draw.text((pad, y), line, font=f_sub, fill=text_color)
-            y += int(0.055 * h)
+            draw.text((pad, y), line, font=f_sub, fill=text_color); y += int(0.055*h)
+        btn_h = int(0.11*h); btn_w = int(0.6*w)
+        btn_x, btn_y = pad, h - pad - btn_h
 
-        btn_h = int(0.11 * h); btn_w = int(0.6 * w)
-        btn_x = pad; btn_y = h - pad - btn_h
-        btn_color = (255,255,255) if sum(text_color) < 384 else (0,0,0)
-        txt_color = (0,0,0) if btn_color == (255,255,255) else (255,255,255)
-        draw.rounded_rectangle([btn_x, btn_y, btn_x+btn_w, btn_y+btn_h], radius=28, fill=btn_color)
-        cta_w = draw.textlength(cta, font=f_cta); cta_h = f_cta.size
-        draw.text((btn_x + (btn_w-cta_w)/2, btn_y + (btn_h-cta_h)/2), cta, font=f_cta, fill=txt_color)
+    btn_color = (255,255,255) if sum(text_color) < 384 else (0,0,0)
+    txt_color = (0,0,0) if btn_color == (255,255,255) else (255,255,255)
+    draw.rounded_rectangle([btn_x, btn_y, btn_x+btn_w, btn_y+btn_h], radius=28, fill=btn_color)
+    cta_w = draw.textlength(cta, font=f_cta); cta_h = f_cta.size
+    draw.text((btn_x + (btn_w-cta_w)/2, btn_y + (btn_h-cta_h)/2), cta, font=f_cta, fill=txt_color)
 
-    # brand footer
     footer = brand_bar
     footer_w = draw.textlength(footer, font=f_brand)
     draw.text((w - pad - footer_w, h - pad - f_brand.size - 4), footer, font=f_brand, fill=text_color)
     return bg
 
+# ---------------- Video (MoviePy) ---------------- #
+@st.cache_resource(show_spinner=False)
+def _try_moviepy():
+    try:
+        from moviepy.editor import ImageClip, concatenate_videoclips, vfx
+        return True
+    except Exception:
+        return False
 
+HAS_MOVIEPY = _try_moviepy()
+
+def make_short_video_mp4(img_intro: Image.Image, img_mid: Image.Image, img_outro: Image.Image,
+                         fps: int = 24, duration_each: float = 2.0, out_size=(720, 1280)) -> bytes:
+    """
+    Build a simple 3-scene vertical MP4 with crossfades from PIL images.
+    """
+    from moviepy.editor import ImageClip, concatenate_videoclips, vfx
+
+    def to_clip(pil_img):
+        # Ensure target size
+        if pil_img.size != out_size:
+            pil_img = pil_img.resize(out_size, Image.LANCZOS)
+        return ImageClip(np.array(pil_img)).set_duration(duration_each)
+
+    c1 = to_clip(img_intro).fx(vfx.fadein, 0.4)
+    c2 = to_clip(img_mid).fx(vfx.fadein, 0.4)
+    c3 = to_clip(img_outro).fx(vfx.fadein, 0.4).fx(vfx.fadeout, 0.4)
+    clip = concatenate_videoclips([c1, c2, c3], method="compose")
+
+    # write to temp path, then return bytes
+    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+        tmp_path = tmp.name
+    clip.write_videofile(tmp_path, fps=fps, audio=False, codec="libx264",
+                         preset="ultrafast", bitrate="1500k", logger=None)
+    with open(tmp_path, "rb") as f:
+        data = f.read()
+    os.remove(tmp_path)
+    return data
+
+# ---------------- Packaging ---------------- #
 def package_zip(artifacts: Dict[str, Any]) -> bytes:
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
@@ -287,15 +289,13 @@ def package_zip(artifacts: Dict[str, Any]) -> bytes:
         for item in artifacts["images"]:
             img: Image.Image = item["image"]
             path = item["path"]
-            b = io.BytesIO()
-            img.save(b, format="PNG")
-            b.seek(0)
+            b = io.BytesIO(); img.save(b, format="PNG"); b.seek(0)
             zf.writestr(path, b.read())
-        # include a quick README inside the ZIP
-        zf.writestr("README.txt", "Ritual Creative Lab — generated assets (PNG) and copy.json. Brand-safe, CPU-only POC.")
+        for v in artifacts.get("videos", []):
+            zf.writestr(v["path"], v["data"])
+        zf.writestr("README.txt", "Ritual Creative Lab — generated PNG posters, MP4 videos (if enabled), and copy.json.")
     buf.seek(0)
     return buf.read()
-
 
 # ---------------- UI ---------------- #
 def header_bar():
@@ -334,7 +334,7 @@ def main():
 
         c1, c2 = st.columns(2)
         if c1.button("Load Demo Campaign"): load_demo()
-        use_lite = c2.selectbox("Copy mode", ["Lite Templates (recommended)", "FLAN-small (experimental)"]) == "Lite Templates (recommended)"
+        copy_mode = c2.selectbox("Copy mode", ["Lite Templates (recommended)", "FLAN-small (experimental)"])
 
         brand_desc = st.text_area("Brand description (who/why/ritual):", key="brand_desc", height=110)
         goal = st.selectbox("Primary goal", ["Awareness", "Engagement", "Signups/Leads", "Sales/Conversions"], key="goal")
@@ -343,7 +343,7 @@ def main():
         st.markdown("---")
         st.subheader("Personas (one per line)")
         personas_text = st.text_area("Examples: 'Fitness-curious millennials', 'CTOs at seed-stage SaaS', etc.", key="personas_text", height=140)
-        k_clusters = st.slider("Number of persona segments", min_value=1, max_value=6, value=2)
+        k_clusters = st.slider("Number of persona segments", 1, 6, 2)
         n_variants = st.slider("Variants per segment", 1, 3, 2)
 
         st.markdown("---")
@@ -353,6 +353,13 @@ def main():
         secondary_hex = col[1].color_picker("Secondary", "#111827")
         brand_bar_text = st.text_input("Footer brand bar", BRAND_BAR_DEFAULT)
         template_style = st.selectbox("Poster template", ["Hero", "Split Stripe"])
+
+        st.markdown("---")
+        st.subheader("Video (optional)")
+        gen_videos = st.toggle("Generate videos (MP4)", value=False,
+                               help="Creates a short vertical MP4 per variant (3 scenes with fades).")
+        video_res = st.selectbox("Resolution", ["720x1280 (fast)", "1080x1920 (slower)"])
+        res_map = {"720x1280 (fast)": (720,1280), "1080x1920 (slower)": (1080,1920)}
 
         st.markdown("---")
         with st.expander("Integrations (preview)"):
@@ -366,10 +373,9 @@ def main():
     with tabs[0]:
         st.markdown("### Creative Plan")
         st.write(
-            "- Cluster personas → generate **tight ad copy** per segment → auto-create **premium posters**.\n"
-            "- CPU-only. Optional model usage for experimentation; templates are production-polished.\n"
-            "- Outputs: headline, body, CTA, channel + 2 PNG visuals per variant.\n"
-            "- Download everything as a ZIP from the final tab."
+            "- Cluster personas → generate tight ad copy → auto-create premium posters.\n"
+            "- Optional: generate short MP4 videos per variant (3 scenes with fades).\n"
+            "- Outputs: headline, body, CTA, channel, PNGs (+ MP4 if enabled) and a ZIP export."
         )
         if brand_desc: st.info(f"Brand Summary: {brand_desc}")
         if personas:
@@ -393,54 +399,80 @@ def main():
             now_tag = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
             colors = (hex_to_rgb(primary_hex), hex_to_rgb(secondary_hex))
 
+            artifacts_videos = []  # accumulate for ZIP
+
             for seg_idx, seg_title in enumerate(summaries):
                 seg_personas = [p for p, lab in zip(personas, labels) if lab == seg_idx]
                 if not seg_personas: continue
+                rep_label = seg_personas[0]  # representative persona for cleaner headlines
 
                 st.write(f"#### {seg_title}")
                 st.caption(f"Personas in this segment: {', '.join(seg_personas)}")
 
                 seg_outputs = {"segment": seg_title, "variants": []}
-                persona_hint = ", ".join(seg_personas[:3])
-
                 for v in range(n_variants):
-                    if use_lite or GEN is None:
-                        headline, body, cta = compose_copy_lite(brand_desc, goal, tone, seg_title)
+                    if copy_mode.startswith("Lite") or GEN is None:
+                        headline, body, cta = compose_copy_lite(brand_desc, goal, tone, rep_label)
                     else:
-                        prompt = make_copy_prompt(brand_desc, goal, tone, f"{seg_title}. People like: {persona_hint}.")
+                        prompt = make_copy_prompt(brand_desc, goal, tone, rep_label)
                         try:
                             raw = gen_text(GEN, prompt, max_tokens=128)
                             headline, body, cta = parse_copy(raw)
                         except Exception:
-                            headline, body, cta = compose_copy_lite(brand_desc, goal, tone, seg_title)
+                            headline, body, cta = compose_copy_lite(brand_desc, goal, tone, rep_label)
 
                     channel = suggest_channel(goal)
-                    posters = [
-                        draw_poster(headline, body, cta, tone, size=(1080, 1350),
-                                    template=template_style, brand_bar=brand_bar_text, color_override=colors)
-                        for _ in range(2)
-                    ]
+                    # posters
+                    intro = draw_poster(headline, "", cta, tone, size=(1080, 1350),
+                                        template=template_style, brand_bar=brand_bar_text, color_override=colors)
+                    mid   = draw_poster(headline, body, cta, tone, size=(1080, 1350),
+                                        template=template_style, brand_bar=brand_bar_text, color_override=colors)
+                    outro = draw_poster(headline, body, cta, tone, size=(1080, 1350),
+                                        template=template_style, brand_bar=brand_bar_text, color_override=colors)
+
+                    cols = st.columns(2)
+                    cols[0].image(intro, caption=f"Variant {v+1} Visual A", use_column_width=True)
+                    cols[1].image(mid,   caption=f"Variant {v+1} Visual B", use_column_width=True)
+                    st.caption(f"Predicted Engagement Lift: **{seeded_score(brand_desc, seg_title, goal, tone, v)}%**  •  Suggested: **{channel}**")
+
+                    # optional video
+                    video_bytes = None
+                    if gen_videos:
+                        if not HAS_MOVIEPY:
+                            st.warning("MoviePy/ffmpeg unavailable — skipping video. (It will auto-install on next deploy.)")
+                        else:
+                            try:
+                                video_bytes = make_short_video_mp4(intro, mid, outro, fps=24,
+                                                                   duration_each=2.0,
+                                                                   out_size=res_map[video_res])
+                                st.video(video_bytes)
+                                artifacts_videos.append({
+                                    "path": f"videos/segment{seg_idx+1}_variant{v+1}.mp4",
+                                    "data": video_bytes
+                                })
+                            except Exception as e:
+                                st.warning(f"Video render failed: {e}")
 
                     seg_outputs["variants"].append({
                         "headline": headline, "body": body, "cta": cta,
-                        "channel": channel, "personas": seg_personas
+                        "channel": channel, "personas": seg_personas,
+                        "video": bool(video_bytes)
                     })
-
-                    c1, c2 = st.columns(2)
-                    c1.image(posters[0], caption=f"Variant {v+1} Visual A", use_column_width=True)
-                    c2.image(posters[1], caption=f"Variant {v+1} Visual B", use_column_width=True)
-                    st.caption(f"Predicted Engagement Lift: **{seeded_score(brand_desc, seg_title, goal, tone, v)}%**  •  Suggested: **{channel}**")
 
                 st.session_state["segments"].append(seg_outputs)
 
-            # prepare artifacts for ZIP
+            # Prepare artifacts for ZIP
             images_for_zip = []
             for s_i, seg in enumerate(st.session_state["segments"]):
                 for v_i, variant in enumerate(seg["variants"]):
-                    for ab in ["A", "B"]:
-                        img = draw_poster(variant["headline"], variant["body"], variant["cta"], tone,
-                                          size=(1080, 1350), template=template_style,
-                                          brand_bar=brand_bar_text, color_override=colors)
+                    for ab, img in zip(["A","B"], [
+                        draw_poster(variant["headline"], "", variant["cta"], tone,
+                                    size=(1080, 1350), template=template_style,
+                                    brand_bar=brand_bar_text, color_override=colors),
+                        draw_poster(variant["headline"], variant["body"], variant["cta"], tone,
+                                    size=(1080, 1350), template=template_style,
+                                    brand_bar=brand_bar_text, color_override=colors),
+                    ]):
                         path = f"images/segment{s_i+1}_variant{v_i+1}_{ab}.png"
                         images_for_zip.append({"image": img, "path": path})
 
@@ -448,9 +480,15 @@ def main():
                 "brand": brand_desc, "goal": goal, "tone": tone,
                 "segments": st.session_state["segments"],
                 "meta": {"generated_at_utc": datetime.utcnow().isoformat() + "Z",
-                         "copy_mode": "lite" if use_lite or GEN is None else "flan-small"}
+                         "copy_mode": "lite" if copy_mode.startswith("Lite") or GEN is None else "flan-small",
+                         "videos_enabled": bool(gen_videos and HAS_MOVIEPY)}
             }
-            st.session_state["artifacts"] = {"copy": copy_payload, "images": images_for_zip, "tag": now_tag}
+            st.session_state["artifacts"] = {
+                "copy": copy_payload,
+                "images": images_for_zip,
+                "videos": artifacts_videos,
+                "tag": now_tag
+            }
             st.success("Generation complete. Review & download in the next tab.")
 
     with tabs[2]:
@@ -461,14 +499,20 @@ def main():
             for seg in st.session_state["artifacts"]["copy"]["segments"]:
                 st.write(f"**{seg['segment']}**")
                 for idx, v in enumerate(seg["variants"], start=1):
-                    st.write(f"- **V{idx}** — **{v['headline']}**  \n  {v['body']}  \n  _CTA: {v['cta']}_  \n  _Channel: {v['channel']}_")
+                    st.write(
+                        f"- **V{idx}** — **{v['headline']}**  \n"
+                        f"  {v['body']}  \n"
+                        f"  _CTA: {v['cta']}_  \n"
+                        f"  _Channel: {v['channel']}_  \n"
+                        f"  _Video:_ {'Yes' if v.get('video') else 'No'}"
+                    )
 
             zip_bytes = package_zip(st.session_state["artifacts"])
             name = f"ritual_ads_poc_{st.session_state['artifacts']['tag']}.zip"
-            st.download_button("⬇️ Download ZIP (PNG + copy.json)", data=zip_bytes, file_name=name,
-                               mime="application/zip", use_container_width=True)
+            st.download_button("⬇️ Download ZIP (PNG + MP4 + copy.json)",
+                               data=zip_bytes, file_name=name, mime="application/zip",
+                               use_container_width=True)
             st.caption("All assets are generated locally. Modify tone/personas or brand kit, re-run, and download again.")
-
 
 if __name__ == "__main__":
     main()
