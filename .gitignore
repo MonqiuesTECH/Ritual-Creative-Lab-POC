@@ -1,0 +1,11 @@
+# venv & caches
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+
+# artifacts
+*.zip
+
+# streamlit
+.streamlit/secrets.toml
